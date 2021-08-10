@@ -206,8 +206,18 @@ class ItemRenderer implements IListRenderer<CompletionItem, ISuggestionTemplateD
 			matches: createMatches(element.score)
 		};
 
+		if (data.iconContainer.firstChild) {
+			data.iconContainer.removeChild(data.iconContainer.firstChild);
+		}
+
 		let color: string[] = [];
-		if (suggestion.kind === CompletionItemKind.Color && extractColor(element, color)) {
+
+		if (suggestion.customIcon) {
+			data.icon.className = 'icon hide';
+			data.iconContainer.className = 'suggest-icon custom-icon';
+			append(data.iconContainer, suggestion.customIcon);
+		}
+		else if (suggestion.kind === CompletionItemKind.Color && extractColor(element, color)) {
 			// special logic for 'color' completion items
 			data.icon.className = 'icon customcolor';
 			data.iconContainer.className = 'icon hide';

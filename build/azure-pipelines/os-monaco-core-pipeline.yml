@@ -15,7 +15,5 @@ stages:
     - task: NodeTool@0
       inputs:
         versionSpec: "12.14.1"
-        #displayName: 'Install Node.js'
     - script: |
         yarn
-#        displayName: 'npm install and build'

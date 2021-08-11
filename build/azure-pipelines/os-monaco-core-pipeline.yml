@@ -23,4 +23,4 @@ stages:
       inputs:
         versionSpec: "12.14.1"
     - script: |
-        node_modules/.bin/gulp editor-distro
+        ./node_modules/.bin/gulp editor-distro

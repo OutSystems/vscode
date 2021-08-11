@@ -10,10 +10,17 @@ stages:
   jobs:
   - job: Build
     displayName: 'Build Job'
-    #timeoutInMinutes: 8
     steps:
     - task: NodeTool@0
       inputs:
         versionSpec: "12.14.1"
     - script: |
         yarn
+  - job: CreateMonacoCorePackage
+    displayName: 'Creates the Monaco core package based on the build'
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: "12.14.1"
+    - script: |
+        node_modules/.bin/gulp editor-distro

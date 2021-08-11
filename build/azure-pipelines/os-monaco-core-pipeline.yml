@@ -17,6 +17,5 @@ stages:
         versionSpec: "12.14.1"
         #displayName: 'Install Node.js'
     - script: |
-        npm install
-        npm run build
+        yarn
 #        displayName: 'npm install and build'

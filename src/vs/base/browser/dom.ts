@@ -1202,7 +1202,7 @@ export function computeScreenAwareSize(cssPx: number): number {
  * See https://mathiasbynens.github.io/rel-noopener/
  */
 export function windowOpenNoOpener(url: string): void {
-	// (jul) Updated this method with the code from the vscode main branch with version "1.68.0",
+	// (jul) Updated this method with the code from the vscode main branch with version "1.60.0",
 	// to fix the issue reported in https://outsystemsrd.atlassian.net/browse/RMAC-9632
 
 	// By using 'noopener' in the `windowFeatures` argument, the newly created window will

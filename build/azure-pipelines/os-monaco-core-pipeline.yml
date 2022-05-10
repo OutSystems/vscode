@@ -1,5 +1,5 @@
 pool:
-  vmImage: 'windows-latest'
+  vmImage: 'VS2017-Win2016'
 
 trigger:
   branches:
@@ -20,8 +20,6 @@ stages:
     - task: NodeTool@0
       inputs:
         versionSpec: "12.14.1"
-    - script: |
-        yarn global add windows-build-tools
     - script: |
         yarn
     - script: |

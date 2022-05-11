@@ -1202,16 +1202,17 @@ export function computeScreenAwareSize(cssPx: number): number {
  * See https://mathiasbynens.github.io/rel-noopener/
  */
 export function windowOpenNoOpener(url: string): void {
-	// (jul) Updated this method with the code from the vscode main branch with version "1.68.0",
-	// to fix the issue reported in https://outsystemsrd.atlassian.net/browse/RMAC-9632
-
-	// By using 'noopener' in the `windowFeatures` argument, the newly created window will
-	// not be able to use `window.opener` to reach back to the current page.
-	// See https://stackoverflow.com/a/46958731
-	// See https://developer.mozilla.org/en-US/docs/Web/API/Window/open#noopener
-	// However, this also doesn't allow us to realize if the browser blocked
-	// the creation of the window.
-	window.open(url, '_blank', 'noopener');
+	if (platform.isNative || browser.isEdgeWebView) {
+		// In VSCode, window.open() always returns null...
+		// The same is true for a WebView (see https://github.com/Microsoft/monaco-editor/issues/628)
+		window.open(url);
+	} else {
+		let newTab = window.open();
+		if (newTab) {
+			(newTab as any).opener = null;
+			newTab.location.href = url;
+		}
+	}
 }
 
 export function animate(fn: () => void): IDisposable {

@@ -8,7 +8,7 @@ import { ParseError, parse, getNodeType } from 'vs/base/common/json';
 import { IJSONSchema } from 'vs/base/common/jsonSchema';
 import * as types from 'vs/base/common/types';
 import { URI } from 'vs/base/common/uri';
-import { CharacterPair, CommentRule, EnterAction, ExplicitLanguageConfiguration, FoldingRules, IAutoClosingPair, IAutoClosingPairConditional, IndentAction, IndentationRule, OnEnterRule } from 'vs/editor/common/modes/languageConfiguration';
+import { CharacterPair, CommentRule, EnterAction, ExplicitLanguageConfiguration, FoldingRules, IAutoClosingPairConditional, IndentAction, IndentationRule, OnEnterRule } from 'vs/editor/common/modes/languageConfiguration';
 import { LanguageConfigurationRegistry } from 'vs/editor/common/modes/languageConfigurationRegistry';
 import { IModeService } from 'vs/editor/common/services/modeService';
 import { Extensions, IJSONContributionRegistry } from 'vs/platform/jsonschemas/common/jsonContributionRegistry';
@@ -47,7 +47,7 @@ interface ILanguageConfiguration {
 	comments?: CommentRule;
 	brackets?: CharacterPair[];
 	autoClosingPairs?: Array<CharacterPair | IAutoClosingPairConditional>;
-	surroundingPairs?: Array<CharacterPair | IAutoClosingPair>;
+	surroundingPairs?: Array<CharacterPair | IAutoClosingPairConditional>;
 	colorizedBracketPairs?: Array<CharacterPair>;
 	wordPattern?: string | IRegExp;
 	indentationRules?: IIndentationRules;
@@ -227,7 +227,7 @@ export class LanguageConfigurationFileHandler {
 		return result;
 	}
 
-	private _extractValidSurroundingPairs(languageId: string, configuration: ILanguageConfiguration): IAutoClosingPair[] | undefined {
+	private _extractValidSurroundingPairs(languageId: string, configuration: ILanguageConfiguration): IAutoClosingPairConditional[] | undefined {
 		const source = configuration.surroundingPairs;
 		if (typeof source === 'undefined') {
 			return undefined;
@@ -237,7 +237,7 @@ export class LanguageConfigurationFileHandler {
 			return undefined;
 		}
 
-		let result: IAutoClosingPair[] | undefined = undefined;
+		let result: IAutoClosingPairConditional[] | undefined = undefined;
 		for (let i = 0, len = source.length; i < len; i++) {
 			const pair = source[i];
 			if (Array.isArray(pair)) {
@@ -260,8 +260,14 @@ export class LanguageConfigurationFileHandler {
 					console.warn(`[${languageId}]: language configuration: expected \`surroundingPairs[${i}].close\` to be a string.`);
 					continue;
 				}
+				if (typeof pair.notIn !== 'undefined') {
+					if (!isStringArr(pair.notIn)) {
+						console.warn(`[${languageId}]: language configuration: expected \`autoClosingPairs[${i}].notIn\` to be a string array.`);
+						continue;
+					}
+				}
 				result = result || [];
-				result.push({ open: pair.open, close: pair.close });
+				result.push({ open: pair.open, close: pair.close, notIn: pair.notIn });
 			}
 		}
 		return result;

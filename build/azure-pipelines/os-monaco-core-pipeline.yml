@@ -1,5 +1,5 @@
 pool:
-  vmImage: 'windows-2019'
+  vmImage: 'windows-latest'
 
 trigger:
   branches:
@@ -37,7 +37,7 @@ stages:
   - deployment: Deploy
     displayName: 'Deploy to npm private repository and creates a git release'
     pool:
-      vmImage: 'windows-2019'
+      vmImage: 'windows-latest'
     environment: Automatic-Release
     strategy:
       runOnce:

@@ -638,6 +638,10 @@ export interface CompletionItem {
 	 */
 	action?: Command;
 	/**
+	 * Custom icon to be used (instead of those ones that depend on the completionItem kind)
+	 */
+	customIcon?: HTMLElement;
+	/**
 	 * @internal
 	 */
 	extensionId?: ExtensionIdentifier;

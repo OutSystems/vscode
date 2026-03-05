@@ -7423,6 +7423,10 @@ declare namespace monaco.languages {
 		 * A command that should be run upon acceptance of this item.
 		 */
 		action?: Command;
+		/**
+		 * Custom icon to be used (instead of those ones that depend on the completionItem kind)
+		 */
+		customIcon?: HTMLElement;
 	}
 
 	export interface CompletionList {

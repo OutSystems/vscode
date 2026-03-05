@@ -19,11 +19,10 @@ stages:
     steps:
     - task: NodeTool@0
       inputs:
-        versionSpec: "14.17.3"
-    - script: |
-        yarn
-    - script: |
-       ./node_modules/.bin/gulp editor-distro
+        versionSource: fromFile
+        versionFilePath: .nvmrc
+    - script: npm ci
+    - script: npm run gulp editor-distro
     - task: PublishPipelineArtifact@1
       inputs:
         targetPath: './out-monaco-editor-core'

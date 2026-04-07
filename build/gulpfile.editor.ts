@@ -202,6 +202,10 @@ const finalEditorResourcesTask = task.define('final-editor-resources', () => {
 				}));
 			}))
 			.pipe(gulp.dest('out-monaco-editor-core')),
+
+		// codicon.ttf
+		gulp.src('src/vs/base/browser/ui/codicons/codicon/codicon.ttf')
+			.pipe(gulp.dest('out-monaco-editor-core/esm/vs/base/browser/ui/codicons/codicon')),
 	);
 });
 

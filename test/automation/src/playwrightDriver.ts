@@ -3,96 +3,543 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as playwright from 'playwright';
-import { ChildProcess, spawn } from 'child_process';
-import { join } from 'path';
-import { mkdir } from 'fs';
-import { promisify } from 'util';
-import { IDriver, IDisposable, IWindowDriver } from './driver';
-import { URI } from 'vscode-uri';
-import * as kill from 'tree-kill';
-import { PageFunction } from 'playwright-core/types/structs';
+import * as playwright from '@playwright/test';
+import type { Protocol } from 'playwright-core/types/protocol';
+import { dirname, join } from 'path';
+import { promises, readFileSync } from 'fs';
+import { IWindowDriver } from './driver';
+import { measureAndLog } from './logger';
+import { LaunchOptions } from './code';
+import { teardown } from './processes';
+import { ChildProcess } from 'child_process';
+import type { AxeResults, RunOptions } from 'axe-core';
 
-const width = 1200;
-const height = 800;
+// Load axe-core source for injection into pages (works with Electron)
+let axeSource = '';
+try {
+	const axePath = require.resolve('axe-core/axe.min.js');
+	axeSource = readFileSync(axePath, 'utf-8');
+} catch {
+	// axe-core may not be installed; keep axeSource empty to avoid failing module initialization
+	axeSource = '';
+}
 
-const root = join(__dirname, '..', '..', '..');
-const logsPath = join(root, '.build', 'logs', 'smoke-tests-browser');
+type PageFunction<Arg, T> = (arg: Arg) => T | Promise<T>;
 
-const vscodeToPlaywrightKey: { [key: string]: string } = {
-	cmd: 'Meta',
-	ctrl: 'Control',
-	shift: 'Shift',
-	enter: 'Enter',
-	escape: 'Escape',
-	right: 'ArrowRight',
-	up: 'ArrowUp',
-	down: 'ArrowDown',
-	left: 'ArrowLeft',
-	home: 'Home',
-	esc: 'Escape'
-};
+export interface AccessibilityScanOptions {
+	/** Specific selector to scan. If not provided, scans the entire page. */
+	selector?: string;
+	/** WCAG tags to include (e.g., 'wcag2a', 'wcag2aa', 'wcag21aa'). Defaults to WCAG 2.1 AA. */
+	tags?: string[];
+	/** Rule IDs to disable for this scan. */
+	disableRules?: string[];
+	/**
+	 * Patterns to exclude from specific rules. Keys are rule IDs, values are strings to match against element target or HTML.
+	 *
+	 * **IMPORTANT**: Adding exclusions here bypasses accessibility checks. Before adding an exclusion:
+	 * 1. File an issue to track the accessibility problem
+	 * 2. Ensure there's a plan to fix the underlying issue (e.g., hover/focus states that axe can't detect)
+	 * 3. Get approval from @anthropics/accessibility team
+	 */
+	excludeRules?: { [ruleId: string]: string[] };
+}
 
-let traceCounter = 1;
+export class PlaywrightDriver {
 
-class PlaywrightDriver implements IDriver {
+	private static traceCounter = 1;
+	private static screenShotCounter = 1;
 
-	_serviceBrand: undefined;
+	private static readonly vscodeToPlaywrightKey: { [key: string]: string } = {
+		cmd: 'Meta',
+		ctrl: 'Control',
+		shift: 'Shift',
+		enter: 'Enter',
+		escape: 'Escape',
+		right: 'ArrowRight',
+		up: 'ArrowUp',
+		down: 'ArrowDown',
+		left: 'ArrowLeft',
+		home: 'Home',
+		esc: 'Escape'
+	};
 
 	constructor(
-		private readonly server: ChildProcess,
-		private readonly browser: playwright.Browser,
+		private readonly application: playwright.Browser | playwright.ElectronApplication,
 		private readonly context: playwright.BrowserContext,
-		readonly page: playwright.Page
+		private _currentPage: playwright.Page,
+		private readonly serverProcess: ChildProcess | undefined,
+		private readonly whenLoaded: Promise<unknown>,
+		private readonly options: LaunchOptions
 	) {
 	}
 
-	async getWindowIds() {
-		return [1];
+	get browserContext(): playwright.BrowserContext {
+		return this.context;
 	}
 
-	async capturePage() {
-		return '';
+	private get page(): playwright.Page {
+		return this._currentPage;
 	}
 
-	async reloadWindow(windowId: number) {
-		throw new Error('Unsupported');
+	get currentPage(): playwright.Page {
+		return this._currentPage;
 	}
 
-	async exitApplication() {
+	/**
+	 * Get all open windows/pages.
+	 * For Electron apps, returns all Electron windows.
+	 * For browser contexts, returns all pages.
+	 */
+	getAllWindows(): playwright.Page[] {
+		if ('windows' in this.application) {
+			return (this.application as playwright.ElectronApplication).windows();
+		}
+		return this.context.pages();
+	}
+
+	/**
+	 * Switch to a different window by index or URL pattern.
+	 * @param indexOrUrl - Window index (0-based) or a string to match against the URL.
+	 *                     When using a string, it first tries to find an exact URL match,
+	 *                     then falls back to finding the first URL that contains the pattern.
+	 * @returns The switched-to page, or undefined if not found
+	 * @note When switching windows, any existing CDP session will be cleared since it
+	 *       remains attached to the previous page and cannot be used with the new page.
+	 */
+	switchToWindow(indexOrUrl: number | string): playwright.Page | undefined {
+		const windows = this.getAllWindows();
+		if (typeof indexOrUrl === 'number') {
+			if (indexOrUrl >= 0 && indexOrUrl < windows.length) {
+				this._currentPage = windows[indexOrUrl];
+				// Clear CDP session as it's attached to the previous page
+				this._cdpSession = undefined;
+				return this._currentPage;
+			}
+		} else {
+			// First try exact match, then fall back to substring match
+			let found = windows.find(w => w.url() === indexOrUrl);
+			if (!found) {
+				found = windows.find(w => w.url().includes(indexOrUrl));
+			}
+			if (found) {
+				this._currentPage = found;
+				// Clear CDP session as it's attached to the previous page
+				this._cdpSession = undefined;
+				return this._currentPage;
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * Get information about all windows.
+	 */
+	getWindowsInfo(): { index: number; url: string; isCurrent: boolean }[] {
+		const windows = this.getAllWindows();
+		return windows.map((p, index) => ({
+			index,
+			url: p.url(),
+			isCurrent: p === this._currentPage
+		}));
+	}
+
+	/**
+	 * Take a screenshot of the current window.
+	 * @param fullPage - Whether to capture the full scrollable page
+	 * @returns Screenshot as a Buffer
+	 */
+	async screenshotBuffer(fullPage: boolean = false): Promise<Buffer> {
+		return await this.page.screenshot({
+			type: 'png',
+			fullPage
+		});
+	}
+
+	/**
+	 * Get the accessibility snapshot of the current window.
+	 */
+	async getAccessibilitySnapshot(): Promise<playwright.Accessibility['snapshot'] extends () => Promise<infer T> ? T : never> {
+		return await this.page.accessibility.snapshot();
+	}
+
+	/**
+	 * Click on an element using CSS selector with options.
+	 */
+	async clickSelector(selector: string, options?: { button?: 'left' | 'right' | 'middle'; clickCount?: number }): Promise<void> {
+		await this.page.click(selector, {
+			button: options?.button ?? 'left',
+			clickCount: options?.clickCount ?? 1
+		});
+	}
+
+	/**
+	 * Type text into an element.
+	 * @param selector - CSS selector for the element
+	 * @param text - Text to type
+	 * @param slowly - Whether to type character by character (triggers key events)
+	 */
+	async typeText(selector: string, text: string, slowly: boolean = false): Promise<void> {
+		if (slowly) {
+			await this.page.type(selector, text, { delay: 50 });
+		} else {
+			await this.page.fill(selector, text);
+		}
+	}
+
+	/**
+	 * Evaluate a JavaScript expression in the current window.
+	 */
+	async evaluateExpression<T = unknown>(expression: string): Promise<T> {
+		return await this.page.evaluate(expression) as T;
+	}
+
+	/**
+	 * Get information about elements matching a selector.
+	 */
+	async getLocatorInfo(selector: string, action?: 'count' | 'textContent' | 'innerHTML' | 'boundingBox' | 'isVisible'): Promise<
+		number | string[] | { x: number; y: number; width: number; height: number } | null | boolean | { count: number; firstVisible: boolean }
+	> {
+		const locator = this.page.locator(selector);
+
+		switch (action) {
+			case 'count':
+				return await locator.count();
+			case 'textContent':
+				return await locator.allTextContents();
+			case 'innerHTML':
+				return await locator.allInnerTexts();
+			case 'boundingBox':
+				return await locator.first().boundingBox();
+			case 'isVisible':
+				return await locator.first().isVisible();
+			default:
+				return {
+					count: await locator.count(),
+					firstVisible: await locator.first().isVisible().catch(() => false)
+				};
+		}
+	}
+
+	/**
+	 * Wait for an element to reach a specific state.
+	 */
+	async waitForElement(selector: string, options?: { state?: 'attached' | 'detached' | 'visible' | 'hidden'; timeout?: number }): Promise<void> {
+		await this.page.waitForSelector(selector, {
+			state: options?.state ?? 'visible',
+			timeout: options?.timeout ?? 30000
+		});
+	}
+
+	/**
+	 * Hover over an element.
+	 */
+	async hoverSelector(selector: string): Promise<void> {
+		await this.page.hover(selector);
+	}
+
+	/**
+	 * Drag from one element to another.
+	 */
+	async dragSelector(sourceSelector: string, targetSelector: string): Promise<void> {
+		await this.page.dragAndDrop(sourceSelector, targetSelector);
+	}
+
+	/**
+	 * Press a key or key combination.
+	 */
+	async pressKey(key: string): Promise<void> {
+		await this.page.keyboard.press(key);
+	}
+
+	/**
+	 * Move mouse to a specific position.
+	 */
+	async mouseMove(x: number, y: number): Promise<void> {
+		await this.page.mouse.move(x, y);
+	}
+
+	/**
+	 * Click at a specific position.
+	 */
+	async mouseClick(x: number, y: number, options?: { button?: 'left' | 'right' | 'middle'; clickCount?: number }): Promise<void> {
+		await this.page.mouse.click(x, y, {
+			button: options?.button ?? 'left',
+			clickCount: options?.clickCount ?? 1
+		});
+	}
+
+	/**
+	 * Drag from one position to another.
+	 */
+	async mouseDrag(startX: number, startY: number, endX: number, endY: number): Promise<void> {
+		await this.page.mouse.move(startX, startY);
+		await this.page.mouse.down();
+		await this.page.mouse.move(endX, endY);
+		await this.page.mouse.up();
+	}
+
+	/**
+	 * Select an option in a dropdown.
+	 */
+	async selectOption(selector: string, value: string | string[]): Promise<string[]> {
+		return await this.page.selectOption(selector, value);
+	}
+
+	/**
+	 * Fill multiple form fields at once.
+	 */
+	async fillForm(fields: { selector: string; value: string }[]): Promise<void> {
+		for (const field of fields) {
+			await this.page.fill(field.selector, field.value);
+		}
+	}
+
+	/**
+	 * Get console messages from the current window.
+	 */
+	async getConsoleMessages(): Promise<{ type: string; text: string }[]> {
+		const messages = await this.page.consoleMessages();
+		return messages.map(m => ({
+			type: m.type(),
+			text: m.text()
+		}));
+	}
+
+	/**
+	 * Wait for text to appear, disappear, or a specified time to pass.
+	 */
+	async waitForText(options: { text?: string; textGone?: string; timeout?: number }): Promise<void> {
+		const { text, textGone, timeout = 30000 } = options;
+
+		if (text) {
+			await this.page.getByText(text).first().waitFor({ state: 'visible', timeout });
+		}
+		if (textGone) {
+			await this.page.getByText(textGone).first().waitFor({ state: 'hidden', timeout });
+		}
+	}
+
+	/**
+	 * Wait for a specified time in milliseconds.
+	 */
+	async waitForTime(ms: number): Promise<void> {
+		await new Promise(resolve => setTimeout(resolve, ms));
+	}
+
+	/**
+	 * Verify an element is visible.
+	 */
+	async verifyElementVisible(selector: string): Promise<boolean> {
 		try {
-			await this.warnAfter(this.context.tracing.stop({ path: join(logsPath, `playwright-trace-${traceCounter++}.zip`) }), 5000, 'Stopping playwright trace took >5seconds');
+			await this.page.locator(selector).first().waitFor({ state: 'visible', timeout: 5000 });
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Verify text is visible on the page.
+	 */
+	async verifyTextVisible(text: string): Promise<boolean> {
+		try {
+			await this.page.getByText(text).first().waitFor({ state: 'visible', timeout: 5000 });
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Get the value of an input element.
+	 */
+	async getInputValue(selector: string): Promise<string> {
+		return await this.page.inputValue(selector);
+	}
+
+	async startTracing(name?: string): Promise<void> {
+		if (!this.options.tracing) {
+			return; // tracing disabled
+		}
+
+		try {
+			await measureAndLog(() => this.context.tracing.startChunk({ title: name }), `startTracing${name ? ` for ${name}` : ''}`, this.options.logger);
 		} catch (error) {
-			console.warn(`Failed to stop playwright tracing: ${error}`);
+			// Ignore
+		}
+	}
+
+	async stopTracing(name?: string, persist: boolean = false): Promise<void> {
+		if (!this.options.tracing) {
+			return; // tracing disabled
 		}
 
 		try {
-			await this.warnAfter(this.browser.close(), 5000, 'Closing playwright browser took >5seconds');
+			let persistPath: string | undefined = undefined;
+			if (persist) {
+				const nameSuffix = name ? `-${name.replace(/\s+/g, '-')}` : '';
+				persistPath = join(this.options.logsPath, `playwright-trace-${PlaywrightDriver.traceCounter++}${nameSuffix}.zip`);
+			}
+
+			await measureAndLog(() => this.context.tracing.stopChunk({ path: persistPath }), `stopTracing${name ? ` for ${name}` : ''}`, this.options.logger);
+
+			// To ensure we have a screenshot at the end where
+			// it failed, also trigger one explicitly. Tracing
+			// does not guarantee to give us a screenshot unless
+			// some driver action ran before.
+			if (persist) {
+				await this.takeScreenshot(name);
+			}
 		} catch (error) {
-			console.warn(`Failed to close browser: ${error}`);
+			// Ignore
 		}
-
-		await this.warnAfter(teardown(this.server), 5000, 'Tearing down server took >5seconds');
-
-		return false;
 	}
 
-	private async warnAfter(promise: Promise<void>, delay: number, msg: string): Promise<void> {
-		const timeout = setTimeout(() => console.warn(msg), delay);
+	async didFinishLoad(): Promise<void> {
+		await this.whenLoaded;
+	}
 
+	private _cdpSession: playwright.CDPSession | undefined;
+
+	async startCDP() {
+		if (this._cdpSession) {
+			return;
+		}
+
+		this._cdpSession = await this.page.context().newCDPSession(this.page);
+	}
+
+	async collectGarbage() {
+		if (!this._cdpSession) {
+			throw new Error('CDP not started');
+		}
+
+		await this._cdpSession.send('HeapProfiler.collectGarbage');
+	}
+
+	async evaluate(options: Protocol.Runtime.evaluateParameters): Promise<Protocol.Runtime.evaluateReturnValue> {
+		if (!this._cdpSession) {
+			throw new Error('CDP not started');
+		}
+
+		return await this._cdpSession.send('Runtime.evaluate', options);
+	}
+
+	async releaseObjectGroup(parameters: Protocol.Runtime.releaseObjectGroupParameters): Promise<void> {
+		if (!this._cdpSession) {
+			throw new Error('CDP not started');
+		}
+
+		await this._cdpSession.send('Runtime.releaseObjectGroup', parameters);
+	}
+
+	async queryObjects(parameters: Protocol.Runtime.queryObjectsParameters): Promise<Protocol.Runtime.queryObjectsReturnValue> {
+		if (!this._cdpSession) {
+			throw new Error('CDP not started');
+		}
+
+		return await this._cdpSession.send('Runtime.queryObjects', parameters);
+	}
+
+	async callFunctionOn(parameters: Protocol.Runtime.callFunctionOnParameters): Promise<Protocol.Runtime.callFunctionOnReturnValue> {
+		if (!this._cdpSession) {
+			throw new Error('CDP not started');
+		}
+
+		return await this._cdpSession.send('Runtime.callFunctionOn', parameters);
+	}
+
+	async takeHeapSnapshot(): Promise<string> {
+		if (!this._cdpSession) {
+			throw new Error('CDP not started');
+		}
+
+		let snapshot = '';
+		const listener = (c: { chunk: string }) => {
+			snapshot += c.chunk;
+		};
+
+		this._cdpSession.addListener('HeapProfiler.addHeapSnapshotChunk', listener);
+
+		await this._cdpSession.send('HeapProfiler.takeHeapSnapshot');
+
+		this._cdpSession.removeListener('HeapProfiler.addHeapSnapshotChunk', listener);
+		return snapshot;
+	}
+
+	async getProperties(parameters: Protocol.Runtime.getPropertiesParameters): Promise<Protocol.Runtime.getPropertiesReturnValue> {
+		if (!this._cdpSession) {
+			throw new Error('CDP not started');
+		}
+
+		return await this._cdpSession.send('Runtime.getProperties', parameters);
+	}
+
+	private async takeScreenshot(name?: string): Promise<void> {
 		try {
-			await promise;
-		} finally {
-			clearTimeout(timeout);
+			const nameSuffix = name ? `-${name.replace(/\s+/g, '-')}` : '';
+			const persistPath = join(this.options.logsPath, `playwright-screenshot-${PlaywrightDriver.screenShotCounter++}${nameSuffix}.png`);
+
+			await measureAndLog(() => this.page.screenshot({ path: persistPath, type: 'png' }), 'takeScreenshot', this.options.logger);
+		} catch (error) {
+			// Ignore
 		}
 	}
 
-	async dispatchKeybinding(windowId: number, keybinding: string) {
+	async reload() {
+		await this.page.reload();
+	}
+
+	async close() {
+
+		// Stop tracing
+		try {
+			if (this.options.tracing) {
+				await measureAndLog(() => this.context.tracing.stop(), 'stop tracing', this.options.logger);
+			}
+		} catch (error) {
+			// Ignore
+		}
+
+		// Web: Extract client logs
+		if (this.options.web) {
+			try {
+				await measureAndLog(() => this.saveWebClientLogs(), 'saveWebClientLogs()', this.options.logger);
+			} catch (error) {
+				this.options.logger.log(`Error saving web client logs (${error})`);
+			}
+		}
+
+		//  exit via `close` method
+		try {
+			await measureAndLog(() => this.application.close(), 'playwright.close()', this.options.logger);
+		} catch (error) {
+			this.options.logger.log(`Error closing application (${error})`);
+		}
+
+		// Server: via `teardown`
+		if (this.serverProcess) {
+			await measureAndLog(() => teardown(this.serverProcess!, this.options.logger), 'teardown server process', this.options.logger);
+		}
+	}
+
+	private async saveWebClientLogs(): Promise<void> {
+		const logs = await this.getLogs();
+
+		for (const log of logs) {
+			const absoluteLogsPath = join(this.options.logsPath, log.relativePath);
+
+			await promises.mkdir(dirname(absoluteLogsPath), { recursive: true });
+			await promises.writeFile(absoluteLogsPath, log.contents);
+		}
+	}
+
+	async sendKeybinding(keybinding: string, accept?: () => Promise<void> | void) {
 		const chords = keybinding.split(' ');
 		for (let i = 0; i < chords.length; i++) {
 			const chord = chords[i];
 			if (i > 0) {
-				await this.timeout(100);
+				await this.wait(100);
 			}
 
 			if (keybinding.startsWith('Alt') || keybinding.startsWith('Control') || keybinding.startsWith('Backspace')) {
@@ -103,8 +550,8 @@ class PlaywrightDriver implements IDriver {
 			const keys = chord.split('+');
 			const keysDown: string[] = [];
 			for (let i = 0; i < keys.length; i++) {
-				if (keys[i] in vscodeToPlaywrightKey) {
-					keys[i] = vscodeToPlaywrightKey[keys[i]];
+				if (keys[i] in PlaywrightDriver.vscodeToPlaywrightKey) {
+					keys[i] = PlaywrightDriver.vscodeToPlaywrightKey[keys[i]];
 				}
 				await this.page.keyboard.down(keys[i]);
 				keysDown.push(keys[i]);
@@ -114,212 +561,201 @@ class PlaywrightDriver implements IDriver {
 			}
 		}
 
-		await this.timeout(100);
+		await accept?.();
 	}
 
-	async click(windowId: number, selector: string, xoffset?: number | undefined, yoffset?: number | undefined) {
-		const { x, y } = await this.getElementXY(windowId, selector, xoffset, yoffset);
+	async click(selector: string, xoffset?: number | undefined, yoffset?: number | undefined) {
+		const { x, y } = await this.getElementXY(selector, xoffset, yoffset);
 		await this.page.mouse.click(x + (xoffset ? xoffset : 0), y + (yoffset ? yoffset : 0));
 	}
 
-	async doubleClick(windowId: number, selector: string) {
-		await this.click(windowId, selector, 0, 0);
-		await this.timeout(60);
-		await this.click(windowId, selector, 0, 0);
-		await this.timeout(100);
+	async setValue(selector: string, text: string) {
+		return this.page.evaluate(([driver, selector, text]) => driver.setValue(selector, text), [await this.getDriverHandle(), selector, text] as const);
 	}
 
-	async setValue(windowId: number, selector: string, text: string) {
-		return this.page.evaluate(([driver, selector, text]) => driver.setValue(selector, text), [await this._getDriverHandle(), selector, text] as const);
+	async getTitle() {
+		return this.page.title();
 	}
 
-	async getTitle(windowId: number) {
-		return this._evaluateWithDriver(([driver]) => driver.getTitle());
+	async isActiveElement(selector: string) {
+		return this.page.evaluate(([driver, selector]) => driver.isActiveElement(selector), [await this.getDriverHandle(), selector] as const);
 	}
 
-	async isActiveElement(windowId: number, selector: string) {
-		return this.page.evaluate(([driver, selector]) => driver.isActiveElement(selector), [await this._getDriverHandle(), selector] as const);
+	async getElements(selector: string, recursive: boolean = false) {
+		return this.page.evaluate(([driver, selector, recursive]) => driver.getElements(selector, recursive), [await this.getDriverHandle(), selector, recursive] as const);
 	}
 
-	async getElements(windowId: number, selector: string, recursive: boolean = false) {
-		return this.page.evaluate(([driver, selector, recursive]) => driver.getElements(selector, recursive), [await this._getDriverHandle(), selector, recursive] as const);
+	async getElementXY(selector: string, xoffset?: number, yoffset?: number) {
+		return this.page.evaluate(([driver, selector, xoffset, yoffset]) => driver.getElementXY(selector, xoffset, yoffset), [await this.getDriverHandle(), selector, xoffset, yoffset] as const);
 	}
 
-	async getElementXY(windowId: number, selector: string, xoffset?: number, yoffset?: number) {
-		return this.page.evaluate(([driver, selector, xoffset, yoffset]) => driver.getElementXY(selector, xoffset, yoffset), [await this._getDriverHandle(), selector, xoffset, yoffset] as const);
+	async typeInEditor(selector: string, text: string) {
+		return this.page.evaluate(([driver, selector, text]) => driver.typeInEditor(selector, text), [await this.getDriverHandle(), selector, text] as const);
 	}
 
-	async typeInEditor(windowId: number, selector: string, text: string) {
-		return this.page.evaluate(([driver, selector, text]) => driver.typeInEditor(selector, text), [await this._getDriverHandle(), selector, text] as const);
+	async getEditorSelection(selector: string) {
+		return this.page.evaluate(([driver, selector]) => driver.getEditorSelection(selector), [await this.getDriverHandle(), selector] as const);
 	}
 
-	async getTerminalBuffer(windowId: number, selector: string) {
-		return this.page.evaluate(([driver, selector]) => driver.getTerminalBuffer(selector), [await this._getDriverHandle(), selector] as const);
+	async getTerminalBuffer(selector: string) {
+		return this.page.evaluate(([driver, selector]) => driver.getTerminalBuffer(selector), [await this.getDriverHandle(), selector] as const);
 	}
 
-	async writeInTerminal(windowId: number, selector: string, text: string) {
-		return this.page.evaluate(([driver, selector, text]) => driver.writeInTerminal(selector, text), [await this._getDriverHandle(), selector, text] as const);
+	async writeInTerminal(selector: string, text: string) {
+		return this.page.evaluate(([driver, selector, text]) => driver.writeInTerminal(selector, text), [await this.getDriverHandle(), selector, text] as const);
 	}
 
-	async getLocaleInfo(windowId: number) {
-		return this._evaluateWithDriver(([driver]) => driver.getLocaleInfo());
+	async getLocaleInfo() {
+		return this.evaluateWithDriver(([driver]) => driver.getLocaleInfo());
 	}
 
-	async getLocalizedStrings(windowId: number) {
-		return this._evaluateWithDriver(([driver]) => driver.getLocalizedStrings());
+	async getLocalizedStrings() {
+		return this.evaluateWithDriver(([driver]) => driver.getLocalizedStrings());
 	}
 
-	private async _evaluateWithDriver<T>(pageFunction: PageFunction<playwright.JSHandle<IWindowDriver>[], T>) {
-		return this.page.evaluate(pageFunction, [await this._getDriverHandle()]);
+	async getLogs() {
+		return this.page.evaluate(([driver]) => driver.getLogs(), [await this.getDriverHandle()] as const);
 	}
 
-	private timeout(ms: number): Promise<void> {
-		return new Promise<void>(resolve => setTimeout(resolve, ms));
+	private async evaluateWithDriver<T>(pageFunction: PageFunction<IWindowDriver[], T>) {
+		return this.page.evaluate(pageFunction, [await this.getDriverHandle()]);
 	}
 
-	// TODO: Cache
-	private async _getDriverHandle(): Promise<playwright.JSHandle<IWindowDriver>> {
+	wait(ms: number): Promise<void> {
+		return wait(ms);
+	}
+
+	whenWorkbenchRestored(): Promise<void> {
+		return this.evaluateWithDriver(([driver]) => driver.whenWorkbenchRestored());
+	}
+
+	private async getDriverHandle(): Promise<playwright.JSHandle<IWindowDriver>> {
 		return this.page.evaluateHandle('window.driver');
 	}
-}
 
-let port = 9000;
-
-export interface PlaywrightOptions {
-	readonly browser?: 'chromium' | 'webkit' | 'firefox';
-	readonly headless?: boolean;
-}
-
-export async function launch(codeServerPath = process.env.VSCODE_REMOTE_SERVER_PATH, userDataDir: string, extensionsPath: string, workspacePath: string, verbose: boolean, options: PlaywrightOptions = {}): Promise<{ serverProcess: ChildProcess, client: IDisposable, driver: IDriver }> {
-
-	// Launch server
-	const { serverProcess, endpoint } = await launchServer(userDataDir, codeServerPath, extensionsPath, verbose);
-
-	// Launch browser
-	const { browser, context, page } = await launchBrowser(options, endpoint, workspacePath);
-
-	return {
-		serverProcess,
-		client: {
-			dispose: () => { /* there is no client to dispose for browser, teardown is triggered via exitApplication call */ }
-		},
-		driver: new PlaywrightDriver(serverProcess, browser, context, page)
-	};
-}
-
-async function launchServer(userDataDir: string, codeServerPath: string | undefined, extensionsPath: string, verbose: boolean) {
-	const agentFolder = userDataDir;
-	await promisify(mkdir)(agentFolder);
-	const env = {
-		VSCODE_AGENT_FOLDER: agentFolder,
-		VSCODE_REMOTE_SERVER_PATH: codeServerPath,
-		...process.env
-	};
-
-	const args = ['--disable-telemetry', '--port', `${port++}`, '--browser', 'none', '--driver', 'web', '--extensions-dir', extensionsPath];
-
-	let serverLocation: string | undefined;
-	if (codeServerPath) {
-		serverLocation = join(codeServerPath, `server.${process.platform === 'win32' ? 'cmd' : 'sh'}`);
-		args.push(`--logsPath=${logsPath}`);
-
-		if (verbose) {
-			console.log(`Starting built server from '${serverLocation}'`);
-			console.log(`Storing log files into '${logsPath}'`);
-		}
-	} else {
-		serverLocation = join(root, `resources/server/web.${process.platform === 'win32' ? 'bat' : 'sh'}`);
-		args.push('--logsPath', logsPath);
-
-		if (verbose) {
-			console.log(`Starting server out of sources from '${serverLocation}'`);
-			console.log(`Storing log files into '${logsPath}'`);
-		}
-	}
-
-	const serverProcess = spawn(
-		serverLocation,
-		args,
-		{ env }
-	);
-
-	if (verbose) {
-		console.info(`*** Started server for browser smoke tests (pid: ${serverProcess.pid})`);
-		serverProcess.once('exit', (code, signal) => console.info(`*** Server for browser smoke tests terminated (pid: ${serverProcess.pid}, code: ${code}, signal: ${signal})`));
-
-		serverProcess.stderr?.on('data', error => console.log(`Server stderr: ${error}`));
-		serverProcess.stdout?.on('data', data => console.log(`Server stdout: ${data}`));
-	}
-
-	process.on('exit', () => teardown(serverProcess));
-	process.on('SIGINT', () => teardown(serverProcess));
-	process.on('SIGTERM', () => teardown(serverProcess));
-
-	return {
-		serverProcess,
-		endpoint: await waitForEndpoint(serverProcess)
-	};
-}
-
-async function launchBrowser(options: PlaywrightOptions, endpoint: string, workspacePath: string) {
-	const browser = await playwright[options.browser ?? 'chromium'].launch({ headless: options.headless ?? false });
-	const context = await browser.newContext();
-
-	try {
-		await context.tracing.start({ screenshots: true, snapshots: true });
-	} catch (error) {
-		console.warn(`Failed to start playwright tracing.`); // do not fail the build when this fails
-	}
-
-	const page = await context.newPage();
-	await page.setViewportSize({ width, height });
-
-	page.on('pageerror', async (error) => console.error(`Playwright ERROR: page error: ${error}`));
-	page.on('crash', page => console.error('Playwright ERROR: page crash'));
-	page.on('response', async (response) => {
-		if (response.status() >= 400) {
-			console.error(`Playwright ERROR: HTTP status ${response.status()} for ${response.url()}`);
-		}
-	});
-
-	const payloadParam = `[["enableProposedApi",""],["skipWelcome","true"]]`;
-	await page.goto(`${endpoint}&folder=vscode-remote://localhost:9888${URI.file(workspacePath!).path}&payload=${payloadParam}`);
-
-	return { browser, context, page };
-}
-
-async function teardown(server: ChildProcess): Promise<void> {
-	const serverPid = server.pid;
-	if (typeof serverPid !== 'number') {
-		return;
-	}
-
-	let retries = 0;
-	while (retries < 3) {
-		retries++;
-
+	async isAlive(): Promise<boolean> {
 		try {
-			return await promisify(kill)(serverPid);
+			await this.getDriverHandle();
+			return true;
 		} catch (error) {
-			try {
-				process.kill(serverPid, 0); // throws an exception if the process doesn't exist anymore
-				console.warn(`Error tearing down server (pid: ${serverPid}, attempt: ${retries}): ${error}`);
-			} catch (error) {
-				return; // Expected when process is gone
-			}
+			return false;
 		}
 	}
 
-	console.error(`Gave up tearing down server after ${retries} attempts...`);
+	/**
+	 * Run an accessibility scan on the current page using axe-core.
+	 * Uses direct script injection to work with Electron.
+	 * @param options Configuration options for the accessibility scan.
+	 * @returns The axe-core scan results including any violations found.
+	 */
+	async runAccessibilityScan(options?: AccessibilityScanOptions): Promise<AxeResults> {
+		// Inject axe-core into the page if not already present
+		await this.page.evaluate(axeSource);
+
+		// Build axe-core run options
+		const runOptions: RunOptions = {
+			runOnly: {
+				type: 'tag',
+				values: options?.tags ?? ['wcag2a', 'wcag2aa', 'wcag21aa']
+			}
+		};
+
+		// Disable specific rules if requested
+		if (options?.disableRules && options.disableRules.length > 0) {
+			runOptions.rules = {};
+			for (const ruleId of options.disableRules) {
+				runOptions.rules[ruleId] = { enabled: false };
+			}
+		}
+
+		// Build context for axe.run
+		const context: { include?: string[]; exclude?: string[][] } = {};
+
+		if (options?.selector) {
+			context.include = [options.selector];
+		}
+
+		// Exclude known problematic areas
+		context.exclude = [
+			['.monaco-editor .view-lines'],
+			['.xterm-screen canvas']
+		];
+
+		// Run axe-core analysis
+		const results = await measureAndLog(
+			() => this.page.evaluate(
+				([ctx, opts]) => {
+					// @ts-expect-error axe is injected globally
+					return window.axe.run(ctx, opts);
+				},
+				[context, runOptions] as const
+			),
+			'runAccessibilityScan',
+			this.options.logger
+		);
+
+		return results as AxeResults;
+	}
+
+	/**
+	 * Run an accessibility scan and throw an error if any violations are found.
+	 * @param options Configuration options for the accessibility scan.
+	 * @throws Error if accessibility violations are detected.
+	 */
+	async assertNoAccessibilityViolations(options?: AccessibilityScanOptions): Promise<void> {
+		const results = await this.runAccessibilityScan(options);
+
+		// Filter out violations for specific elements based on excludeRules
+		let filteredViolations = results.violations;
+		if (options?.excludeRules) {
+			filteredViolations = results.violations.map((violation: AxeResults['violations'][number]) => {
+				const excludePatterns = options.excludeRules![violation.id];
+				if (!excludePatterns) {
+					return violation;
+				}
+				// Filter out nodes that match any of the exclude patterns
+				const filteredNodes = violation.nodes.filter((node: AxeResults['violations'][number]['nodes'][number]) => {
+					const target = node.target.join(' ');
+					const html = node.html || '';
+					// Check if any exclude pattern appears in target or HTML
+					return !excludePatterns.some(pattern => target.includes(pattern) || html.includes(pattern));
+				});
+				return { ...violation, nodes: filteredNodes };
+			}).filter((violation: AxeResults['violations'][number]) => violation.nodes.length > 0);
+		}
+
+		if (filteredViolations.length > 0) {
+			const violationMessages = filteredViolations.map((violation: AxeResults['violations'][number]) => {
+				const nodes = violation.nodes.map((node: AxeResults['violations'][number]['nodes'][number]) => {
+					const target = node.target.join(' > ');
+					const html = node.html || 'N/A';
+					// Extract class from HTML for easier identification
+					const classMatch = html.match(/class="([^"]+)"/);
+					const className = classMatch ? classMatch[1] : 'no class';
+					return [
+						`  Element: ${target}`,
+						`    Class: ${className}`,
+						`    HTML: ${html}`,
+						`    Issue: ${node.failureSummary}`
+					].join('\n');
+				}).join('\n\n');
+				return [
+					`[${violation.id}] ${violation.help} (${violation.impact})`,
+					`  Help URL: ${violation.helpUrl}`,
+					nodes
+				].join('\n');
+			}).join('\n\n---\n\n');
+
+			throw new Error(
+				`Accessibility violations found:\n\n${violationMessages}\n\n` +
+				`Total: ${filteredViolations.length} violation(s) affecting ${filteredViolations.reduce((sum: number, v: AxeResults['violations'][number]) => sum + v.nodes.length, 0)} element(s)`
+			);
+		}
+	}
 }
 
-function waitForEndpoint(server: ChildProcess): Promise<string> {
-	return new Promise<string>(resolve => {
-		server.stdout?.on('data', (d: Buffer) => {
-			const matches = d.toString('ascii').match(/Web UI available at (.+)/);
-			if (matches !== null) {
-				resolve(matches[1]);
-			}
-		});
-	});
+export function wait(ms: number): Promise<void> {
+	return new Promise<void>(resolve => setTimeout(resolve, ms));
 }
+
+export type { AxeResults };

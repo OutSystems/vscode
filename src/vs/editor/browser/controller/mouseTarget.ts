@@ -1173,8 +1173,8 @@ function shadowCaretRangeFromPoint(shadowRoot: ShadowRoot, x: number, y: number)
 
 		// Creates a range with the text node of the element and set the offset found
 		if (el.firstChild!.nodeType === 3 /* TEXT_NODE */) {
-      range.setStart(el.firstChild!, offset);
-      range.setEnd(el.firstChild!, offset);
+  		range.setStart(el.firstChild!, offset);
+  		range.setEnd(el.firstChild!, offset);
 		} else {
 			range.setStart(el!, 0);
 			range.setEnd(el!, 0);

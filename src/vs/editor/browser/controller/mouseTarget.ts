@@ -1176,8 +1176,8 @@ function shadowCaretRangeFromPoint(shadowRoot: ShadowRoot, x: number, y: number)
       range.setStart(el.firstChild!, offset);
       range.setEnd(el.firstChild!, offset);
 		} else {
-				range.setStart(el!, 0);
-				range.setEnd(el!, 0);
+			range.setStart(el!, 0);
+			range.setEnd(el!, 0);
 		}
 	}
 

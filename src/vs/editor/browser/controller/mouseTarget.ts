@@ -1175,10 +1175,10 @@ function shadowCaretRangeFromPoint(shadowRoot: ShadowRoot, x: number, y: number)
 		if (el.firstChild!.nodeType === 3 /* TEXT_NODE */) {
       range.setStart(el.firstChild!, offset);
       range.setEnd(el.firstChild!, offset);
-  } else {
-      range.setStart(el!, 0);
-      range.setEnd(el!, 0);
-  }
+		} else {
+				range.setStart(el!, 0);
+				range.setEnd(el!, 0);
+		}
 	}
 
 	return range;
